@@ -1,0 +1,4 @@
+# Ignore generated traces (large files)
+raw/
+parsed/
+progress.json
