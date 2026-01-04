@@ -1,9 +1,9 @@
 """
-Validate all ARC-AGI-2 training tasks with parallel execution.
+Validate all ARC-AGI-2 training tasks with batched parallel execution.
 
 Run: uv run validate_all_tasks.py
      uv run validate_all_tasks.py --sample 10              # test on 10 tasks first
-     uv run validate_all_tasks.py --parallel-tasks 16      # run 16 tasks in parallel
+     uv run validate_all_tasks.py --max-concurrent 64      # max concurrent API calls
      uv run validate_all_tasks.py --resume                 # resume from checkpoint
 """
 import argparse
@@ -14,7 +14,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from validate_task import validate_task, TASKS_FILE
+from validate_task import (
+    generate_description,
+    generate_and_test_program,
+    get_client,
+    TASKS_FILE,
+    SOLUTIONS_FILE,
+    INPUT_PRICE,
+    OUTPUT_PRICE,
+)
 
 RESULTS_FILE = Path(__file__).parent / "validation_results.jsonl"
 SUMMARY_FILE = Path(__file__).parent / "validation_summary.json"
@@ -49,8 +57,149 @@ def save_summary(stats: dict):
             json.dump(stats, f, indent=2)
 
 
-def run_validation(task_ids: list, desc_attempts: int, prog_attempts: int, concurrent: int, parallel_tasks: int = 32):
-    """Run validation on a list of tasks with progress tracking and parallel execution."""
+def run_description_phase(task_ids: list, all_tasks: dict, client, max_concurrent: int = 64) -> dict:
+    """Generate descriptions for all tasks in parallel pool."""
+    results = {}
+    total = len(task_ids)
+    completed = [0]
+    lock = threading.Lock()
+
+    def generate_desc(task_id):
+        task_data = all_tasks[task_id]
+        return task_id, generate_description(client, task_data)
+
+    print(f"\n=== DESCRIPTION PHASE ({total} tasks, {max_concurrent} concurrent) ===")
+
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        futures = {executor.submit(generate_desc, task_id): task_id for task_id in task_ids}
+
+        for future in as_completed(futures):
+            task_id, result = future.result()
+            results[task_id] = result
+
+            with lock:
+                completed[0] += 1
+                status = "✓" if result["description"] else "✗"
+                print(f"[{completed[0]}/{total}] {task_id}: {status} description")
+
+    success_count = sum(1 for r in results.values() if r["description"])
+    print(f"Description phase complete: {success_count}/{total} successful")
+    return results
+
+
+def run_program_phase(
+    descriptions: dict,
+    all_tasks: dict,
+    all_solutions: dict,
+    client,
+    max_concurrent: int = 64,
+    max_attempts: int = 4,
+) -> dict:
+    """Generate programs for all tasks, up to max_attempts each until success."""
+    # Build pending dict: tasks with valid descriptions
+    pending = {}
+    for task_id, desc_result in descriptions.items():
+        if desc_result["description"]:
+            pending[task_id] = {
+                "description": desc_result["description"],
+                "task_data": all_tasks[task_id],
+                "test_solutions": all_solutions.get(task_id, []),
+                "attempts": 0,
+                "tokens": {
+                    "input": desc_result["input_tokens"],
+                    "output": desc_result["output_tokens"],
+                    "thinking": desc_result["thinking_tokens"],
+                },
+            }
+
+    results = {}
+    total = len(pending)
+    lock = threading.Lock()
+
+    print(f"\n=== PROGRAM PHASE ({total} tasks, {max_concurrent} concurrent, max {max_attempts} attempts each) ===")
+
+    attempt_round = 0
+    while pending:
+        attempt_round += 1
+        print(f"\n--- Attempt round {attempt_round} ({len(pending)} tasks remaining) ---")
+
+        def generate_prog(task_id):
+            info = pending[task_id]
+            result = generate_and_test_program(
+                client,
+                info["description"],
+                info["task_data"],
+                info["test_solutions"],
+                attempt=info["attempts"] + 1,
+            )
+            return task_id, result
+
+        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            futures = {executor.submit(generate_prog, task_id): task_id for task_id in list(pending.keys())}
+
+            for future in as_completed(futures):
+                task_id, result = future.result()
+
+                with lock:
+                    info = pending[task_id]
+                    info["attempts"] += 1
+                    info["tokens"]["input"] += result["input_tokens"]
+                    info["tokens"]["output"] += result["output_tokens"]
+                    info["tokens"]["thinking"] += result["thinking_tokens"]
+
+                    if result["success"]:
+                        # Build final result
+                        cost = (info["tokens"]["input"] * INPUT_PRICE / 1_000_000) + \
+                               (info["tokens"]["output"] * OUTPUT_PRICE / 1_000_000)
+                        results[task_id] = {
+                            "task_id": task_id,
+                            "success": True,
+                            "description_attempt": 1,  # Will be updated by caller for round 2
+                            "program_attempt": info["attempts"],
+                            "validated_description": info["description"],
+                            "working_program": result["code"],
+                            "train_passed": result["train_passed"],
+                            "train_total": result["train_total"],
+                            "test_passed": result["test_passed"],
+                            "test_total": result["test_total"],
+                            "total_input_tokens": info["tokens"]["input"],
+                            "total_output_tokens": info["tokens"]["output"],
+                            "total_thinking_tokens": info["tokens"]["thinking"],
+                            "total_cost_usd": round(cost, 4),
+                        }
+                        del pending[task_id]
+                        print(f"  {task_id}: ✓ SUCCESS (attempt {info['attempts']})")
+
+                    elif info["attempts"] >= max_attempts:
+                        # Max attempts reached, mark as failed
+                        cost = (info["tokens"]["input"] * INPUT_PRICE / 1_000_000) + \
+                               (info["tokens"]["output"] * OUTPUT_PRICE / 1_000_000)
+                        results[task_id] = {
+                            "task_id": task_id,
+                            "success": False,
+                            "program_attempts": info["attempts"],
+                            "total_input_tokens": info["tokens"]["input"],
+                            "total_output_tokens": info["tokens"]["output"],
+                            "total_thinking_tokens": info["tokens"]["thinking"],
+                            "total_cost_usd": round(cost, 4),
+                        }
+                        del pending[task_id]
+                        print(f"  {task_id}: ✗ FAILED after {max_attempts} attempts")
+
+    success_count = sum(1 for r in results.values() if r["success"])
+    print(f"\nProgram phase complete: {success_count}/{total} successful")
+    return results
+
+
+def run_validation_batched(
+    task_ids: list,
+    all_tasks: dict,
+    all_solutions: dict,
+    max_concurrent: int = 64,
+    max_description_rounds: int = 2,
+    max_program_attempts: int = 4,
+):
+    """Run batched validation with separate description and program phases."""
     completed = load_completed_tasks()
     remaining = [t for t in task_ids if t not in completed]
 
@@ -62,113 +211,84 @@ def run_validation(task_ids: list, desc_attempts: int, prog_attempts: int, concu
         print("All tasks already validated!")
         return
 
+    client = get_client()
+    all_results = {}
+    remaining_set = set(remaining)
+    start_time = time.time()
+
+    for round_num in range(1, max_description_rounds + 1):
+        if not remaining_set:
+            break
+
+        print(f"\n{'='*60}")
+        print(f"ROUND {round_num}/{max_description_rounds} ({len(remaining_set)} tasks)")
+        print(f"{'='*60}")
+
+        # Phase A: Generate descriptions
+        descriptions = run_description_phase(
+            list(remaining_set), all_tasks, client, max_concurrent
+        )
+
+        # Phase B: Generate and test programs
+        round_results = run_program_phase(
+            descriptions, all_tasks, all_solutions, client, max_concurrent, max_program_attempts
+        )
+
+        # Update description_attempt for this round
+        for task_id, result in round_results.items():
+            result["description_attempt"] = round_num
+            all_results[task_id] = result
+            save_result(result)
+
+            if result["success"]:
+                remaining_set.discard(task_id)
+
+        # Print round summary
+        round_success = sum(1 for r in round_results.values() if r["success"])
+        print(f"\nRound {round_num} complete: {round_success}/{len(round_results)} successful")
+
+    # Final summary
+    elapsed = time.time() - start_time
+    total_success = sum(1 for r in all_results.values() if r["success"])
+    total_cost = sum(r.get("total_cost_usd", 0) for r in all_results.values())
+
     stats = {
         "total": len(task_ids),
-        "completed": len(completed),
-        "success": 0,
-        "failed": 0,
-        "total_cost_usd": 0.0,
-        "total_input_tokens": 0,
-        "total_output_tokens": 0,
-        "total_thinking_tokens": 0,
+        "completed": len(all_results),
+        "success": total_success,
+        "failed": len(all_results) - total_success,
+        "total_cost_usd": round(total_cost, 4),
     }
+    save_summary(stats)
 
-    # Load existing stats
-    if RESULTS_FILE.exists():
-        with open(RESULTS_FILE) as f:
-            for line in f:
-                if line.strip():
-                    r = json.loads(line)
-                    if r.get("success"):
-                        stats["success"] += 1
-                    else:
-                        stats["failed"] += 1
-                    stats["total_cost_usd"] += r.get("total_cost_usd", 0)
-                    stats["total_input_tokens"] += r.get("total_input_tokens", 0)
-                    stats["total_output_tokens"] += r.get("total_output_tokens", 0)
-                    stats["total_thinking_tokens"] += r.get("total_thinking_tokens", 0)
-
-    start_time = time.time()
-    stats_lock = threading.Lock()
-    completed_count = [0]  # Mutable container for tracking progress
-
-    def process_task(task_id):
-        """Process a single task and return the result."""
-        try:
-            return validate_task(
-                task_id,
-                description_attempts=desc_attempts,
-                output_program_attempts=prog_attempts,
-                concurrent_requests=concurrent,
-            )
-        except Exception as e:
-            return {"task_id": task_id, "success": False, "error": str(e)}
-
-    print(f"\nRunning {len(remaining)} tasks with {parallel_tasks} parallel workers...")
-
-    try:
-        with ThreadPoolExecutor(max_workers=parallel_tasks) as executor:
-            futures = {executor.submit(process_task, task_id): task_id for task_id in remaining}
-
-            for future in as_completed(futures):
-                task_id = futures[future]
-                result = future.result()
-
-                save_result(result)
-
-                with stats_lock:
-                    stats["completed"] += 1
-                    completed_count[0] += 1
-
-                    if result.get("success"):
-                        stats["success"] += 1
-                        status = f"✓ SUCCESS (desc={result.get('description_attempt')}, prog={result.get('program_attempt')})"
-                    else:
-                        stats["failed"] += 1
-                        error_msg = result.get("error", "")
-                        status = f"✗ FAILED" + (f": {error_msg}" if error_msg else "")
-
-                    stats["total_cost_usd"] += result.get("total_cost_usd", 0)
-                    stats["total_input_tokens"] += result.get("total_input_tokens", 0)
-                    stats["total_output_tokens"] += result.get("total_output_tokens", 0)
-                    stats["total_thinking_tokens"] += result.get("total_thinking_tokens", 0)
-
-                    print(f"[{completed_count[0]}/{len(remaining)}] {task_id}: {status} | Total: ${stats['total_cost_usd']:.4f}")
-                    save_summary(stats)
-
-    except KeyboardInterrupt:
-        print("\n\nInterrupted! Progress saved.")
-        save_summary(stats)
-
-    elapsed = time.time() - start_time
     print(f"\n{'='*60}")
     print("FINAL SUMMARY")
     print(f"{'='*60}")
-    print(f"Tasks completed: {stats['completed']}/{stats['total']}")
-    print(f"Success: {stats['success']} ({100*stats['success']/max(1,stats['completed']):.1f}%)")
-    print(f"Failed: {stats['failed']}")
-    print(f"Total cost: ${stats['total_cost_usd']:.4f}")
+    print(f"Tasks completed: {len(all_results)}/{len(remaining)}")
+    print(f"Success: {total_success} ({100*total_success/max(1,len(all_results)):.1f}%)")
+    print(f"Failed: {len(all_results) - total_success}")
+    print(f"Total cost: ${total_cost:.4f}")
     print(f"Time elapsed: {elapsed/60:.1f} minutes")
-    print(f"Avg cost/task: ${stats['total_cost_usd']/max(1,stats['completed']):.4f}")
-    print(f"Avg time/task: {elapsed/max(1,len(remaining)-len(task_ids)+stats['completed']):.1f}s")
+    print(f"Avg time/task: {elapsed/max(1,len(all_results)):.1f}s")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate all ARC tasks")
+    parser = argparse.ArgumentParser(description="Validate all ARC tasks (batched)")
     parser.add_argument("--sample", type=int, help="Run on N random tasks only")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
-    parser.add_argument("--description-attempts", type=int, default=2)
-    parser.add_argument("--output-program-attempts", type=int, default=8)
-    parser.add_argument("--concurrent-requests", type=int, default=4)
-    parser.add_argument("--parallel-tasks", type=int, default=32, help="Number of tasks to run in parallel")
+    parser.add_argument("--max-concurrent", type=int, default=64, help="Max concurrent API calls")
+    parser.add_argument("--max-description-rounds", type=int, default=2, help="Max description attempts per task")
+    parser.add_argument("--max-program-attempts", type=int, default=4, help="Max program attempts per description")
     parser.add_argument("--clear", action="store_true", help="Clear previous results and start fresh")
     args = parser.parse_args()
 
-    # Load all task IDs
+    # Load all tasks and solutions
     with open(TASKS_FILE) as f:
         all_tasks = json.load(f)
-    task_ids = sorted(all_tasks.keys())
+    with open(SOLUTIONS_FILE) as f:
+        all_solutions = json.load(f)
 
+    task_ids = sorted(all_tasks.keys())
     print(f"Loaded {len(task_ids)} tasks")
 
     if args.clear:
@@ -183,12 +303,13 @@ def main():
         task_ids = random.sample(task_ids, min(args.sample, len(task_ids)))
         print(f"Sampled {len(task_ids)} tasks")
 
-    run_validation(
+    run_validation_batched(
         task_ids,
-        desc_attempts=args.description_attempts,
-        prog_attempts=args.output_program_attempts,
-        concurrent=args.concurrent_requests,
-        parallel_tasks=args.parallel_tasks,
+        all_tasks,
+        all_solutions,
+        max_concurrent=args.max_concurrent,
+        max_description_rounds=args.max_description_rounds,
+        max_program_attempts=args.max_program_attempts,
     )
 
 

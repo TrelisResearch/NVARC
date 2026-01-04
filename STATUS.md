@@ -2,26 +2,42 @@
 
 ## Completed
 - `validate_task.py` - Generates descriptions via Gemini 3 Flash, tests output programs on train + test examples
-- `validate_all_tasks.py` - Batch runner with progress tracking, resume, and **parallel execution**
+- `validate_all_tasks.py` - Batched parallel execution with separate description and program phases
 - Downloaded 1000 training tasks + solutions to `arc_agi2_training_only/`
-- Added parallel task execution (32 tasks by default, configurable via `--parallel-tasks`)
 
-## Sample Results (10 tasks, sequential)
+## Latest Results (10 tasks, batched parallel)
 - Success: 10/10 (100%)
-- Cost: $0.088 (~$0.009/task)
-- Time: 38 min (~4 min/task)
+- Cost: $0.093 (~$0.009/task)
+- Time: 15.5 min
+- Avg time/task: 93s
 
-## Parallelization
-- Two levels of concurrency:
-  - Level 1: 32 tasks in parallel (new, `--parallel-tasks`)
-  - Level 2: 4 API calls per task (existing, `--concurrent-requests`)
-- Expected runtime for 1000 tasks: ~2 hours (down from ~65 hours)
+## Architecture
+Batched pipeline with single pool per phase:
+```
+ROUND 1:
+  Description Phase (64 concurrent) → 1 description per task
+  Program Phase (64 concurrent) → up to 4 attempts until success
+
+ROUND 2 (failures only):
+  New descriptions → retry programs
+```
+
+## CLI Arguments
+```
+--max-concurrent N          Max concurrent API calls (default: 64)
+--max-description-rounds N  Max description attempts per task (default: 2)
+--max-program-attempts N    Max program attempts per description (default: 4)
+--sample N                  Run on N random tasks only
+--clear                     Clear previous results
+```
+
+## Expected Performance
+- 1000 tasks with 64 concurrent: ~26 hours
+- Can increase concurrency if API allows
 
 ## Next Steps
-1. ~~Refactor for speed~~ DONE - parallel execution implemented
-2. **Re-test 10 tasks** with parallel execution
-3. **Run full 1000** once runtime is confirmed acceptable
+1. **Run full 1000 tasks** with batched pipeline
 
 ## Files
-- `validation_results.jsonl` - Individual task results (10 completed)
+- `validation_results.jsonl` - Individual task results
 - `validation_summary.json` - Aggregate statistics

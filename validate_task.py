@@ -171,6 +171,20 @@ def test_program(code: str, task_data: dict, test_solutions: list = None) -> dic
     return results
 
 
+def generate_description(client: OpenAI, task_data: dict) -> dict:
+    """Generate a description for a task. Returns dict with description and token usage."""
+    prompt = format_description_prompt(task_data)
+    response = call_gemini(client, prompt)
+
+    description = recognize_summary(response["content"])
+    return {
+        "description": description,
+        "input_tokens": response["input_tokens"],
+        "output_tokens": response["output_tokens"],
+        "thinking_tokens": response["thinking_tokens"],
+    }
+
+
 def generate_and_test_program(client: OpenAI, description: dict, task_data: dict, test_solutions: list, attempt: int) -> dict:
     """Generate output program and test it. Returns result dict."""
     prompt = format_output_program_prompt(description, task_data)
