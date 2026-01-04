@@ -44,10 +44,14 @@ This project generates LLM traces for all 1000 ARC-AGI-2 training tasks using **
 - [x] Create validation script (`scripts/validate_traces.py`)
 - [x] Create output directories (`traces/raw/`, `traces/parsed/`)
 
-### ⚠️ Note on Network Access
-The current sandbox environment blocks external API calls. Run the scripts locally or in an environment with:
-- Internet access to `generativelanguage.googleapis.com`
-- Valid `GEMINI_API_KEY` exported
+### ⚠️ Required Network Access
+
+**Domains to allow:**
+```
+generativelanguage.googleapis.com
+```
+
+This is the only domain needed for the Gemini API calls. If running in a restricted environment, ensure HTTPS (port 443) access to this domain is permitted.
 
 ### Phase 2: Trace Generation (Parallelized)
 
