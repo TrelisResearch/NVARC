@@ -1,0 +1,22 @@
+{
+  "task_id": "00576224",
+  "success": true,
+  "description_attempt": 1,
+  "program_attempt": 2,
+  "validated_description": {
+    "rules_summary": "The output grid is a 6x6 grid created by tiling the 2x2 input grid in a 3x3 pattern. While the top (rows 0-1) and bottom (rows 4-5) tiers of the tiling are identical to the input grid, the middle tier (rows 2-3) consists of the input grid horizontally mirrored (with its columns swapped).",
+    "input_generation": "1. Create a 2x2 grid.\n2. Fill each of the four cells with a color (0-9), which may or may not be unique.",
+    "solution_steps": "1. Create a 6x6 output grid, which will hold nine 2x2 blocks arranged in a 3x3 grid.\n2. For the first row of blocks (output rows 0 and 1), place the 2x2 input grid three times horizontally.\n3. For the second row of blocks (output rows 2 and 3), take the 2x2 input grid and mirror it horizontally (swap the left and right columns). Place this mirrored 2x2 grid three times horizontally.\n4. For the third row of blocks (output rows 4 and 5), place the original 2x2 input grid three times horizontally.",
+    "key_insight": "The transformation uses a tiling pattern (3x3 blocks) but introduces a variation (horizontal mirroring) in the middle row of the tiling to create a alternating pattern.",
+    "puzzle_concepts": "[tiling, mirroring, pattern_repetition]"
+  },
+  "working_program": "import numpy as np\n\ndef create_horizontally_mirrored_block(block: np.ndarray) -> np.ndarray:\n    \"\"\"\n    Creates a horizontally mirrored version of the input block.\n    For a 2x2 grid, this swaps the left and right columns.\n    \"\"\"\n    # Use numpy's fliplr which flips the array along the vertical axis (columns)\n    mirrored = np.fliplr(block)\n    return mirrored\n\ndef generate_puzzle_output(input_grid: np.ndarray) -> np.ndarray:\n    \"\"\"\n    Generates a 6x6 output grid by tiling a 2x2 input grid in a 3x3 pattern.\n    The middle row of the 3x3 tiling is horizontally mirrored.\n    \"\"\"\n    # 1. Identify input and output grid properties\n    input_h, input_w = input_grid.shape\n    output_h, output_w = input_h * 3, input_w * 3\n    \n    # Debug information about the input\n    unique_colors = np.unique(input_grid)\n    print(f\"Input grid shape: {input_h}x{input_w}\")\n    print(f\"Unique colors in input: {unique_colors.tolist()}\")\n\n    # 2. Initialize the output grid\n    # Using np.int8 to stay within memory constraints and handle 0-9 colors\n    output_grid = np.zeros((output_h, output_w), dtype=np.int8)\n\n    # 3. Prepare the mirrored version of the input\n    mirrored_grid = create_horizontally_mirrored_block(input_grid)\n    print(f\"Mirrored block created. Top-left color of mirror: {mirrored_grid[0, 0]}\")\n\n    # 4. Perform the tiling\n    # We loop through a 3x3 grid of blocks\n    for row_idx in range(3):\n        for col_idx in range(3):\n            # Determine which block to use: \n            # Row index 1 is the 'middle tier'\n            if row_idx == 1:\n                target_block = mirrored_grid\n                block_type = \"mirrored\"\n            else:\n                target_block = input_grid\n                block_type = \"original\"\n            \n            # Calculate coordinates in the output grid\n            y_start = row_idx * input_h\n            y_end = y_start + input_h\n            x_start = col_idx * input_w\n            x_end = x_start + input_w\n            \n            # Place the block\n            output_grid[y_start:y_end, x_start:x_end] = target_block\n            \n            # Debugging placement (minimal output)\n            if col_idx == 0:\n                print(f\"Placing {block_type} block tier at output row {y_start}\")\n\n    # 5. Final Statistics\n    total_elements = output_grid.size\n    print(f\"Output grid generation complete. Total elements: {total_elements}\")\n    print(f\"Output shape matches expected: {output_grid.shape == (6, 6)}\")\n\n    return output_grid",
+  "train_passed": 2,
+  "train_total": 2,
+  "test_passed": 1,
+  "test_total": 1,
+  "total_input_tokens": 2577,
+  "total_output_tokens": 1667,
+  "total_thinking_tokens": 7248,
+  "total_cost_usd": 0.0063
+}
