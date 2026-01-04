@@ -31,9 +31,22 @@ This project generates LLM traces for all 1000 ARC-AGI-2 training tasks using **
 | Phase | Status | Progress |
 |-------|--------|----------|
 | 1. Infrastructure Setup | Complete | 100% |
-| 2. Trace Generation | Ready to Run | 0/1000 |
+| 2. Trace Generation | **Blocked: Network Access Required** | 0/1000 |
 | 3. Validation & Quality Check | Ready | 0% |
 | 4. Data Export | Not Started | 0% |
+
+### Execution Attempt Log (2026-01-04)
+
+Attempted to run trace generation but encountered network restriction:
+```
+Error: Cannot connect to host generativelanguage.googleapis.com:443 ssl:default
+       [Temporary failure in name resolution]
+```
+
+**Resolution**: Ensure HTTPS access (port 443) to `generativelanguage.googleapis.com` is permitted, then run:
+```bash
+python scripts/generate_traces.py --concurrency 50
+```
 
 ## Task Breakdown
 
@@ -143,7 +156,39 @@ python scripts/generate_traces.py --status
 
 ## Next Steps
 
-1. Create `scripts/generate_traces.py` with async parallelization
-2. Test with 10 tasks first
-3. Run full 1000-task generation
-4. Validate and create quality report
+1. ✅ ~~Create `scripts/generate_traces.py` with async parallelization~~ (Done)
+2. ✅ ~~Initialize ARC-AGI-2 submodule~~ (1000 tasks available)
+3. ⏳ **Unblock network access** to `generativelanguage.googleapis.com`
+4. Run full 1000-task generation:
+   ```bash
+   python scripts/generate_traces.py --concurrency 50
+   ```
+5. Validate and create quality report:
+   ```bash
+   python scripts/validate_traces.py --report
+   ```
+
+## Alternative: Run Locally
+
+If running in a restricted environment, you can run the generation locally:
+
+```bash
+# Clone repo locally
+git clone <repo-url>
+cd NVARC
+git checkout claude/status-md-planning-VK2Tz
+
+# Initialize submodule
+git submodule update --init external/ARC-AGI-2
+
+# Set API key and run
+export GEMINI_API_KEY="your-key"
+pip install aiohttp
+python scripts/generate_traces.py --concurrency 50
+python scripts/validate_traces.py --report
+
+# Push results back
+git add traces/
+git commit -m "Add generated traces for ARC-AGI-2 tasks"
+git push
+```
