@@ -11,6 +11,7 @@ import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from openai import OpenAI
 from pyswip import Prolog
 
 from llm_utils import (

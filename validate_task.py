@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
+from openai import OpenAI
 
 from llm_utils import (
     PROMPTS_DIR,
