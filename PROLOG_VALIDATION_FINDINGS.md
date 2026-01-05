@@ -4,6 +4,27 @@
 
 Investigation into using Prolog for ARC task validation with LLM-generated recognizers and transforms.
 
+## Key Discovery: Checker-Style vs Generator-Style
+
+**Checker-style Prolog works reliably; Generator-style (CLP(FD)) fails consistently.**
+
+| Style | Purpose | Success Rate | Notes |
+|-------|---------|--------------|-------|
+| Checker | Validation only | ~100% (1/1 tested) | Simple syntax, LLM generates correct code |
+| Generator | Validation + Generation | ~0% (0/25 attempts) | CLP(FD) syntax errors, over-constrained |
+
+### Checker-Style (Recommended)
+- Uses standard Prolog: `==`, `\==`, `>=`, `=<`
+- Only validates inputs (accepts/rejects)
+- LLM generates correct code on first attempt
+- Example task `aa18de87`: Train 4/4, Test 1/1, Specificity 10/10 ✓
+
+### Generator-Style (CLP(FD))
+- Uses constraint operators: `#=`, `#\=`, `#>=`, `ins`
+- Can generate valid inputs (for synthetic data)
+- LLM struggles with syntax, produces broken code
+- 0/25 attempts succeeded across 5 tasks
+
 ## Key Changes Made
 
 ### 1. Added Prolog Query Timeouts
@@ -72,13 +93,22 @@ The core issue is **LLM-generated Prolog code quality variance**:
 2. **Multiprocessing**: Replace threading with multiprocessing for true Prolog isolation
 3. **Alternative Prolog**: Consider tau-prolog (JavaScript) or other isolated implementations
 
-## Files Modified
+## Files
 
+### New Files
+| File | Purpose |
+|------|---------|
+| `validate_prolog_single.py` | Single-task validation with `--style checker/generator` flag |
+| `SDG/prompts/prolog_input_recognizer_checker.md` | Checker-style prompt (simple Prolog) |
+| `SDG/prompts/prolog_input_recognizer_generator.md` | Generator-style prompt (CLP(FD)) |
+
+### Modified Files
 | File | Changes |
 |------|---------|
-| `validate_prolog_task.py` | Added timeouts, thread lock, debug output |
-| `validate_prolog_all.py` | Debug output (removed) |
+| `validate_prolog_task.py` | Added timeouts, thread lock |
+| `validate_prolog_all.py` | Minor cleanup |
 | `SDG/prompts/prolog_input_recognizer.md` | Added CLP(FD) operator reference |
+| `llm_utils.py` | Added evaluation task file paths |
 
 ## Test Results
 
