@@ -35,7 +35,7 @@ Two-phase approach using Prolog predicates:
 ROUND 1:
   Recognizer Phase → Generate valid_input/1 predicate
     - Validate on train + test inputs
-    - Specificity test: must reject >= 50% random grids
+    - Specificity test: must reject >= 90% random grids
   Transform Phase → Generate transform/2 predicate
     - Validate on train + test pairs (exact match)
 

@@ -8,49 +8,20 @@ import json
 import os
 import random
 import re
-import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
-from dotenv import load_dotenv
-from openai import OpenAI
 from pyswip import Prolog
 
-load_dotenv()
-
-MODEL = "gemini-3-flash-preview"
-PROMPTS_DIR = Path(__file__).parent / "SDG" / "prompts"
-TASKS_FILE = Path(__file__).parent / "arc_agi2_training_only" / "arc-agi_training_challenges.json"
-SOLUTIONS_FILE = Path(__file__).parent / "arc_agi2_training_only" / "arc-agi_training_solutions.json"
-
-# Pricing per 1M tokens
-INPUT_PRICE = 0.50
-OUTPUT_PRICE = 3.00
-
-
-def get_client():
-    return OpenAI(
-        api_key=os.environ.get("GEMINI_API_KEY"),
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-    )
-
-
-def call_gemini(client: OpenAI, prompt: str, reasoning_effort: str = "high") -> dict:
-    """Call Gemini 3 Flash and return response with token usage."""
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        extra_body={"reasoning_effort": reasoning_effort},
-    )
-    usage = response.usage
-    thinking_tokens = (usage.total_tokens - usage.prompt_tokens - usage.completion_tokens) if usage else 0
-    return {
-        "content": response.choices[0].message.content,
-        "input_tokens": usage.prompt_tokens if usage else 0,
-        "output_tokens": usage.completion_tokens if usage else 0,
-        "thinking_tokens": thinking_tokens,
-    }
+from llm_utils import (
+    PROMPTS_DIR,
+    TASKS_FILE,
+    SOLUTIONS_FILE,
+    INPUT_PRICE,
+    OUTPUT_PRICE,
+    get_client,
+    call_gemini,
+)
 
 
 def grid_to_prolog(grid: list) -> str:
@@ -129,8 +100,11 @@ def test_transform(prolog: Prolog, input_grid: list, expected_output: list) -> b
         return False
 
 
-def test_specificity(prolog: Prolog, train_grids: list, rejection_threshold: float = 0.5) -> dict:
+def test_specificity(prolog: Prolog, train_grids: list, rejection_threshold: float = 0.9) -> dict:
     """Ensure recognizer rejects random grids (not underconstrained).
+
+    A good recognizer should reject most random grids since valid ARC inputs
+    have specific structure. Default 90% = must reject 9/10 random grids.
 
     Returns dict with rejections count and success status.
     """

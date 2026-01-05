@@ -1,3 +1,10 @@
 .env
 __pycache__/
 *.pyc
+
+# Validation results
+validation_results.jsonl
+validation_summary.json
+prolog_validation_result_*.json
+prolog_validation_results.jsonl
+prolog_validation_summary.json
