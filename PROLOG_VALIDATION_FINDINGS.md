@@ -90,7 +90,7 @@ The core issue is **LLM-generated Prolog code quality variance**:
 
 ### Long Term
 1. **Different approach**: Consider DSL or structured output instead of free-form Prolog
-2. **Multiprocessing**: Replace threading with multiprocessing for true Prolog isolation
+2. **Replace pyswip with subprocess**: Use `brew install swi-prolog` and call via subprocess instead of pyswip. Each subprocess is isolated, avoiding the single global Prolog process limitation that breaks parallelism.
 3. **Alternative Prolog**: Consider tau-prolog (JavaScript) or other isolated implementations
 
 ## Files
