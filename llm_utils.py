@@ -13,6 +13,8 @@ MODEL = "gemini-3-flash-preview"
 PROMPTS_DIR = Path(__file__).parent / "SDG" / "prompts"
 TASKS_FILE = Path(__file__).parent / "arc_agi2_training_only" / "arc-agi_training_challenges.json"
 SOLUTIONS_FILE = Path(__file__).parent / "arc_agi2_training_only" / "arc-agi_training_solutions.json"
+EVAL_TASKS_FILE = Path(__file__).parent / "arc_agi2_training_only" / "arc-agi_evaluation_challenges.json"
+EVAL_SOLUTIONS_FILE = Path(__file__).parent / "arc_agi2_training_only" / "arc-agi_evaluation_solutions.json"
 
 # Pricing per 1M tokens
 INPUT_PRICE = 0.50

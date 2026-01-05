@@ -20,11 +20,10 @@ from validate_prolog_task import (
     generate_transform,
     test_transform_full,
     get_client,
-    TASKS_FILE,
-    SOLUTIONS_FILE,
     INPUT_PRICE,
     OUTPUT_PRICE,
 )
+from llm_utils import TASKS_FILE, SOLUTIONS_FILE, EVAL_TASKS_FILE, EVAL_SOLUTIONS_FILE
 
 RESULTS_FILE = Path(__file__).parent / "prolog_validation_results.jsonl"
 SUMMARY_FILE = Path(__file__).parent / "prolog_validation_summary.json"
@@ -359,12 +358,16 @@ def main():
     parser.add_argument("--max-recognizer-rounds", type=int, default=2, help="Max recognizer attempts per task")
     parser.add_argument("--max-transform-attempts", type=int, default=4, help="Max transform attempts per recognizer")
     parser.add_argument("--clear", action="store_true", help="Clear previous results and start fresh")
+    parser.add_argument("--eval", action="store_true", help="Run on evaluation tasks instead of training")
     args = parser.parse_args()
 
-    # Load all tasks and solutions
-    with open(TASKS_FILE) as f:
+    # Load tasks and solutions (evaluation or training)
+    tasks_file = EVAL_TASKS_FILE if args.eval else TASKS_FILE
+    solutions_file = EVAL_SOLUTIONS_FILE if args.eval else SOLUTIONS_FILE
+
+    with open(tasks_file) as f:
         all_tasks = json.load(f)
-    with open(SOLUTIONS_FILE) as f:
+    with open(solutions_file) as f:
         all_solutions = json.load(f)
 
     task_ids = sorted(all_tasks.keys())

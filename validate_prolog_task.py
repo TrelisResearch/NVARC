@@ -8,11 +8,45 @@ import json
 import os
 import random
 import re
+import signal
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
 from pyswip import Prolog
+
+# Global lock for pyswip - pyswip uses a single global Prolog process
+# and is not thread-safe. All Prolog operations must be serialized.
+_prolog_lock = threading.Lock()
+
+# Timeout for Prolog queries (seconds)
+PROLOG_TIMEOUT = 5
+
+
+class PrologTimeoutError(Exception):
+    """Raised when a Prolog query exceeds the timeout."""
+    pass
+
+
+def _timeout_handler(signum, frame):
+    """Signal handler for Prolog query timeout."""
+    raise PrologTimeoutError("Prolog query timed out")
+
+
+def query_with_timeout(prolog: Prolog, query: str, timeout_sec: int = PROLOG_TIMEOUT) -> list:
+    """Run a Prolog query with a timeout.
+
+    Returns list of results (empty if query fails).
+    Raises PrologTimeoutError if query exceeds timeout.
+    """
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(timeout_sec)
+    try:
+        results = list(prolog.query(query, maxresult=1))
+        return results
+    finally:
+        signal.alarm(0)  # Cancel the alarm
 
 from llm_utils import (
     PROMPTS_DIR,
@@ -72,13 +106,16 @@ def test_valid_input(prolog: Prolog, grid: list) -> bool:
     """Test if valid_input(Grid) succeeds for the given grid.
 
     Returns True if the predicate succeeds, False otherwise.
+    Raises PrologTimeoutError if query times out.
     """
     grid_str = grid_to_prolog(grid)
     query = f"valid_input({grid_str})"
 
     try:
-        results = list(prolog.query(query, maxresult=1))
+        results = query_with_timeout(prolog, query)
         return len(results) > 0
+    except PrologTimeoutError:
+        raise  # Re-raise timeout so caller can handle it
     except Exception:
         return False
 
@@ -87,6 +124,7 @@ def test_transform(prolog: Prolog, input_grid: list, expected_output: list) -> b
     """Test if transform(Input, Output) produces the expected output.
 
     Returns True if Output unifies with expected_output.
+    Raises PrologTimeoutError if query times out.
     """
     input_str = grid_to_prolog(input_grid)
     expected_str = grid_to_prolog(expected_output)
@@ -95,8 +133,10 @@ def test_transform(prolog: Prolog, input_grid: list, expected_output: list) -> b
     query = f"transform({input_str}, Output), Output = {expected_str}"
 
     try:
-        results = list(prolog.query(query, maxresult=1))
+        results = query_with_timeout(prolog, query)
         return len(results) > 0
+    except PrologTimeoutError:
+        raise  # Re-raise timeout so caller can handle it
     except Exception:
         return False
 
@@ -124,7 +164,11 @@ def test_specificity(prolog: Prolog, train_grids: list, rejection_threshold: flo
         cols = random.randint(max(1, min_cols - 1), max_cols + 1)
         random_grid = [[random.randint(0, 9) for _ in range(cols)] for _ in range(rows)]
 
-        if not test_valid_input(prolog, random_grid):
+        try:
+            if not test_valid_input(prolog, random_grid):
+                rejections += 1
+        except PrologTimeoutError:
+            # Timeout counts as rejection (couldn't validate)
             rejections += 1
 
     required_rejections = int(total_tests * rejection_threshold)
@@ -201,6 +245,7 @@ def test_input_recognizer(code: str, task_data: dict, test_inputs: list) -> dict
     """Test input recognizer on train AND test inputs, plus specificity.
 
     Returns results dict with pass/fail counts.
+    Thread-safe: uses global lock for pyswip operations.
     """
     train_inputs = [ex["input"] for ex in task_data["train"]]
 
@@ -213,41 +258,43 @@ def test_input_recognizer(code: str, task_data: dict, test_inputs: list) -> dict
         "errors": [],
     }
 
-    try:
-        prolog = create_prolog_engine(code)
-    except Exception as e:
-        results["errors"].append(f"Prolog syntax error: {str(e)[:100]}")
-        return results
-
-    # Test train inputs
-    for i, grid in enumerate(train_inputs):
+    # Lock all Prolog operations - pyswip is not thread-safe
+    with _prolog_lock:
         try:
-            if test_valid_input(prolog, grid):
-                results["train_passed"] += 1
-            else:
-                results["errors"].append(f"Train {i}: valid_input failed")
+            prolog = create_prolog_engine(code)
         except Exception as e:
-            results["errors"].append(f"Train {i}: {type(e).__name__}: {str(e)[:50]}")
+            results["errors"].append(f"Prolog syntax error: {str(e)[:100]}")
+            return results
 
-    # Test test inputs (without leaking to LLM)
-    for i, grid in enumerate(test_inputs):
-        try:
-            if test_valid_input(prolog, grid):
-                results["test_passed"] += 1
-            else:
-                results["errors"].append(f"Test {i}: valid_input failed")
-        except Exception as e:
-            results["errors"].append(f"Test {i}: {type(e).__name__}: {str(e)[:50]}")
+        # Test train inputs
+        for i, grid in enumerate(train_inputs):
+            try:
+                if test_valid_input(prolog, grid):
+                    results["train_passed"] += 1
+                else:
+                    results["errors"].append(f"Train {i}: valid_input failed")
+            except Exception as e:
+                results["errors"].append(f"Train {i}: {type(e).__name__}: {str(e)[:50]}")
 
-    # Specificity test - must reject random grids
-    specificity = test_specificity(prolog, train_inputs)
-    results["specificity_passed"] = specificity["success"]
-    results["specificity_rejections"] = specificity["rejections"]
-    if not specificity["success"]:
-        results["errors"].append(
-            f"Specificity failed: rejected {specificity['rejections']}/{specificity['total_tests']} "
-            f"(need >= {specificity['threshold']})"
-        )
+        # Test test inputs (without leaking to LLM)
+        for i, grid in enumerate(test_inputs):
+            try:
+                if test_valid_input(prolog, grid):
+                    results["test_passed"] += 1
+                else:
+                    results["errors"].append(f"Test {i}: valid_input failed")
+            except Exception as e:
+                results["errors"].append(f"Test {i}: {type(e).__name__}: {str(e)[:50]}")
+
+        # Specificity test - must reject random grids
+        specificity = test_specificity(prolog, train_inputs)
+        results["specificity_passed"] = specificity["success"]
+        results["specificity_rejections"] = specificity["rejections"]
+        if not specificity["success"]:
+            results["errors"].append(
+                f"Specificity failed: rejected {specificity['rejections']}/{specificity['total_tests']} "
+                f"(need >= {specificity['threshold']})"
+            )
 
     # Success = all train + all test + specificity
     results["success"] = (
@@ -280,6 +327,7 @@ def test_transform_full(recognizer_code: str, transform_code: str, task_data: di
     """Test transform/2 on train AND test pairs.
 
     Exact match required for success.
+    Thread-safe: uses global lock for pyswip operations.
     """
     results = {
         "train_passed": 0,
@@ -292,33 +340,35 @@ def test_transform_full(recognizer_code: str, transform_code: str, task_data: di
     # Combine recognizer + transform code
     full_code = recognizer_code + "\n\n" + transform_code
 
-    try:
-        prolog = create_prolog_engine(full_code)
-    except Exception as e:
-        results["errors"].append(f"Prolog syntax error: {str(e)[:100]}")
-        return results
-
-    # Test train pairs
-    for i, ex in enumerate(task_data["train"]):
+    # Lock all Prolog operations - pyswip is not thread-safe
+    with _prolog_lock:
         try:
-            if test_transform(prolog, ex["input"], ex["output"]):
-                results["train_passed"] += 1
-            else:
-                results["errors"].append(f"Train {i}: transform mismatch")
+            prolog = create_prolog_engine(full_code)
         except Exception as e:
-            results["errors"].append(f"Train {i}: {type(e).__name__}: {str(e)[:50]}")
+            results["errors"].append(f"Prolog syntax error: {str(e)[:100]}")
+            return results
 
-    # Test test pairs
-    for i, ex in enumerate(task_data.get("test", [])):
-        if i >= len(test_solutions):
-            continue
-        try:
-            if test_transform(prolog, ex["input"], test_solutions[i]):
-                results["test_passed"] += 1
-            else:
-                results["errors"].append(f"Test {i}: transform mismatch")
-        except Exception as e:
-            results["errors"].append(f"Test {i}: {type(e).__name__}: {str(e)[:50]}")
+        # Test train pairs
+        for i, ex in enumerate(task_data["train"]):
+            try:
+                if test_transform(prolog, ex["input"], ex["output"]):
+                    results["train_passed"] += 1
+                else:
+                    results["errors"].append(f"Train {i}: transform mismatch")
+            except Exception as e:
+                results["errors"].append(f"Train {i}: {type(e).__name__}: {str(e)[:50]}")
+
+        # Test test pairs
+        for i, ex in enumerate(task_data.get("test", [])):
+            if i >= len(test_solutions):
+                continue
+            try:
+                if test_transform(prolog, ex["input"], test_solutions[i]):
+                    results["test_passed"] += 1
+                else:
+                    results["errors"].append(f"Test {i}: transform mismatch")
+            except Exception as e:
+                results["errors"].append(f"Test {i}: {type(e).__name__}: {str(e)[:50]}")
 
     results["success"] = (
         results["train_passed"] == results["train_total"] and
