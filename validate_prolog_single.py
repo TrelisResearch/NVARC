@@ -7,11 +7,6 @@ Run: uv run validate_prolog_single.py --task aa18de87 --style checker
 import argparse
 import json
 import random
-import signal
-import tempfile
-import os
-
-from pyswip import Prolog
 
 from llm_utils import (
     PROMPTS_DIR,
@@ -22,65 +17,12 @@ from llm_utils import (
     get_client,
     call_gemini,
 )
-
-# Timeout for Prolog queries (seconds)
-PROLOG_TIMEOUT = 5
-
-
-class PrologTimeoutError(Exception):
-    pass
-
-
-def _timeout_handler(signum, frame):
-    raise PrologTimeoutError("Prolog query timed out")
-
-
-def query_with_timeout(prolog: Prolog, query: str, timeout_sec: int = PROLOG_TIMEOUT) -> list:
-    signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(timeout_sec)
-    try:
-        results = list(prolog.query(query, maxresult=1))
-        return results
-    finally:
-        signal.alarm(0)
-
-
-def grid_to_prolog(grid: list) -> str:
-    return str(grid).replace(" ", "")
-
-
-def parse_prolog_code(response: str) -> str | None:
-    import re
-    codes = re.findall(r"```prolog(.*?)```", response, re.DOTALL)
-    if not codes:
-        codes = re.findall(r"```(.*?)```", response, re.DOTALL)
-    if not codes:
-        return None
-    return max(codes, key=len).strip()
-
-
-def create_prolog_engine(code: str) -> Prolog:
-    prolog = Prolog()
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.pl', delete=False) as f:
-        f.write(code)
-        temp_path = f.name
-    try:
-        prolog.consult(temp_path)
-    finally:
-        os.unlink(temp_path)
-    return prolog
-
-
-def test_valid_input(prolog: Prolog, grid: list) -> bool:
-    grid_str = grid_to_prolog(grid)
-    query = f"valid_input({grid_str})"
-    try:
-        results = query_with_timeout(prolog, query)
-        return len(results) > 0
-    except PrologTimeoutError:
-        raise
-    except Exception:
-        return False
+from prolog_utils import (
+    PrologTimeoutError,
+    grid_to_prolog,
+    parse_prolog_code,
+    test_valid_input,
+)
 
 
 def format_prompt(task_data: dict, style: str) -> str:
@@ -102,7 +44,7 @@ def format_prompt(task_data: dict, style: str) -> str:
     return template.replace("{TRAIN_INPUTS}", "\n\n".join(inputs_text))
 
 
-def test_specificity(prolog: Prolog, train_grids: list, num_tests: int = 10) -> dict:
+def test_specificity(code: str, train_grids: list, num_tests: int = 10) -> dict:
     """Test that recognizer rejects random grids."""
     min_rows = min(len(g) for g in train_grids)
     max_rows = max(len(g) for g in train_grids)
@@ -116,7 +58,7 @@ def test_specificity(prolog: Prolog, train_grids: list, num_tests: int = 10) -> 
         random_grid = [[random.randint(0, 9) for _ in range(cols)] for _ in range(rows)]
 
         try:
-            if not test_valid_input(prolog, random_grid):
+            if not test_valid_input(code, random_grid):
                 rejections += 1
         except PrologTimeoutError:
             rejections += 1
@@ -175,18 +117,11 @@ def main():
             f.write(code)
         print(f"  Saved to: {debug_file}")
 
-        # Test recognizer
-        try:
-            prolog = create_prolog_engine(code)
-        except Exception as e:
-            print(f"  Prolog syntax error: {str(e)[:80]}")
-            continue
-
         # Test train inputs
         train_passed = 0
         for i, grid in enumerate(train_inputs):
             try:
-                if test_valid_input(prolog, grid):
+                if test_valid_input(code, grid):
                     train_passed += 1
                 else:
                     print(f"  Train {i}: REJECTED")
@@ -199,7 +134,7 @@ def main():
         test_passed = 0
         for i, grid in enumerate(test_inputs):
             try:
-                if test_valid_input(prolog, grid):
+                if test_valid_input(code, grid):
                     test_passed += 1
                 else:
                     print(f"  Test {i}: REJECTED")
@@ -209,7 +144,7 @@ def main():
                 print(f"  Test {i}: ERROR - {e}")
 
         # Specificity test
-        spec = test_specificity(prolog, train_inputs)
+        spec = test_specificity(code, train_inputs)
 
         print(f"  Results: train={train_passed}/{len(train_inputs)}, test={test_passed}/{len(test_inputs)}, specificity={spec['rejections']}/{spec['total']}")
 

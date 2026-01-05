@@ -1,52 +1,12 @@
 """
-Prolog-based ARC task validation using pyswip.
+Prolog-based ARC task validation using subprocess-isolated Prolog.
 
 Run: uv run validate_prolog_task.py --task 00576224
 """
 import argparse
 import json
-import os
 import random
-import re
-import signal
-import tempfile
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from openai import OpenAI
-from pyswip import Prolog
-
-# Global lock for pyswip - pyswip uses a single global Prolog process
-# and is not thread-safe. All Prolog operations must be serialized.
-_prolog_lock = threading.Lock()
-
-# Timeout for Prolog queries (seconds)
-PROLOG_TIMEOUT = 5
-
-
-class PrologTimeoutError(Exception):
-    """Raised when a Prolog query exceeds the timeout."""
-    pass
-
-
-def _timeout_handler(signum, frame):
-    """Signal handler for Prolog query timeout."""
-    raise PrologTimeoutError("Prolog query timed out")
-
-
-def query_with_timeout(prolog: Prolog, query: str, timeout_sec: int = PROLOG_TIMEOUT) -> list:
-    """Run a Prolog query with a timeout.
-
-    Returns list of results (empty if query fails).
-    Raises PrologTimeoutError if query exceeds timeout.
-    """
-    signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(timeout_sec)
-    try:
-        results = list(prolog.query(query, maxresult=1))
-        return results
-    finally:
-        signal.alarm(0)  # Cancel the alarm
 
 from llm_utils import (
     PROMPTS_DIR,
@@ -57,91 +17,16 @@ from llm_utils import (
     get_client,
     call_gemini,
 )
+from prolog_utils import (
+    PrologTimeoutError,
+    grid_to_prolog,
+    parse_prolog_code,
+    test_valid_input,
+    test_transform,
+)
 
 
-def grid_to_prolog(grid: list) -> str:
-    """Convert a grid (list of lists) to Prolog list format.
-
-    Example: [[1,2],[3,4]] -> "[[1,2],[3,4]]"
-    """
-    return str(grid).replace(" ", "")
-
-
-def parse_prolog_code(response: str) -> str | None:
-    """Extract Prolog code from LLM response.
-
-    Looks for ```prolog ... ``` blocks.
-    """
-    codes = re.findall(r"```prolog(.*?)```", response, re.DOTALL)
-    if not codes:
-        # Try without language specifier
-        codes = re.findall(r"```(.*?)```", response, re.DOTALL)
-    if not codes:
-        return None
-    longest_code = max(codes, key=len)
-    return longest_code.strip()
-
-
-def create_prolog_engine(code: str) -> Prolog:
-    """Create Prolog engine by consulting code from temp file.
-
-    Note: pyswip shares global Prolog state, so predicates may be redefined.
-    Warnings about redefined predicates are expected and harmless.
-    """
-    prolog = Prolog()
-
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.pl', delete=False) as f:
-        f.write(code)
-        temp_path = f.name
-
-    try:
-        prolog.consult(temp_path)
-    finally:
-        os.unlink(temp_path)
-
-    return prolog
-
-
-def test_valid_input(prolog: Prolog, grid: list) -> bool:
-    """Test if valid_input(Grid) succeeds for the given grid.
-
-    Returns True if the predicate succeeds, False otherwise.
-    Raises PrologTimeoutError if query times out.
-    """
-    grid_str = grid_to_prolog(grid)
-    query = f"valid_input({grid_str})"
-
-    try:
-        results = query_with_timeout(prolog, query)
-        return len(results) > 0
-    except PrologTimeoutError:
-        raise  # Re-raise timeout so caller can handle it
-    except Exception:
-        return False
-
-
-def test_transform(prolog: Prolog, input_grid: list, expected_output: list) -> bool:
-    """Test if transform(Input, Output) produces the expected output.
-
-    Returns True if Output unifies with expected_output.
-    Raises PrologTimeoutError if query times out.
-    """
-    input_str = grid_to_prolog(input_grid)
-    expected_str = grid_to_prolog(expected_output)
-
-    # Query: transform(Input, Output), Output = Expected
-    query = f"transform({input_str}, Output), Output = {expected_str}"
-
-    try:
-        results = query_with_timeout(prolog, query)
-        return len(results) > 0
-    except PrologTimeoutError:
-        raise  # Re-raise timeout so caller can handle it
-    except Exception:
-        return False
-
-
-def test_specificity(prolog: Prolog, train_grids: list, rejection_threshold: float = 0.9) -> dict:
+def test_specificity(code: str, train_grids: list, rejection_threshold: float = 0.9) -> dict:
     """Ensure recognizer rejects random grids (not underconstrained).
 
     A good recognizer should reject most random grids since valid ARC inputs
@@ -149,7 +34,6 @@ def test_specificity(prolog: Prolog, train_grids: list, rejection_threshold: flo
 
     Returns dict with rejections count and success status.
     """
-    # Get dimension bounds from train grids
     min_rows = min(len(g) for g in train_grids)
     max_rows = max(len(g) for g in train_grids)
     min_cols = min(len(g[0]) for g in train_grids if g)
@@ -159,16 +43,14 @@ def test_specificity(prolog: Prolog, train_grids: list, rejection_threshold: flo
     total_tests = 10
 
     for _ in range(total_tests):
-        # Generate random grid with similar dimensions
         rows = random.randint(max(1, min_rows - 1), max_rows + 1)
         cols = random.randint(max(1, min_cols - 1), max_cols + 1)
         random_grid = [[random.randint(0, 9) for _ in range(cols)] for _ in range(rows)]
 
         try:
-            if not test_valid_input(prolog, random_grid):
+            if not test_valid_input(code, random_grid):
                 rejections += 1
         except PrologTimeoutError:
-            # Timeout counts as rejection (couldn't validate)
             rejections += 1
 
     required_rejections = int(total_tests * rejection_threshold)
@@ -181,13 +63,9 @@ def test_specificity(prolog: Prolog, train_grids: list, rejection_threshold: flo
 
 
 def format_input_recognizer_prompt(task_data: dict) -> str:
-    """Format prompt for input recognizer generation.
-
-    IMPORTANT: Only uses train INPUT grids, not outputs or test inputs.
-    """
+    """Format prompt for input recognizer generation."""
     template = (PROMPTS_DIR / "prolog_input_recognizer.md").read_text()
 
-    # Format train inputs only
     inputs_text = []
     for i, ex in enumerate(task_data["train"]):
         input_grid = ex["input"]
@@ -195,18 +73,13 @@ def format_input_recognizer_prompt(task_data: dict) -> str:
         cols = len(input_grid[0]) if input_grid else 0
         inputs_text.append(f"Example {i+1} ({rows}x{cols}):\n{grid_to_prolog(input_grid)}")
 
-    prompt = template.replace("{TRAIN_INPUTS}", "\n\n".join(inputs_text))
-    return prompt
+    return template.replace("{TRAIN_INPUTS}", "\n\n".join(inputs_text))
 
 
 def format_transform_prompt(recognizer_code: str, task_data: dict) -> str:
-    """Format prompt for transform/2 generation.
-
-    Provides: recognizer code + train input/output pairs.
-    """
+    """Format prompt for transform/2 generation."""
     template = (PROMPTS_DIR / "prolog_transform.md").read_text()
 
-    # Format train pairs
     pairs_text = []
     for i, ex in enumerate(task_data["train"]):
         input_grid = ex["input"]
@@ -219,15 +92,11 @@ def format_transform_prompt(recognizer_code: str, task_data: dict) -> str:
         pairs_text.append("")
 
     prompt = template.replace("{RECOGNIZER_CODE}", recognizer_code)
-    prompt = prompt.replace("{TRAIN_PAIRS}", "\n".join(pairs_text))
-    return prompt
+    return prompt.replace("{TRAIN_PAIRS}", "\n".join(pairs_text))
 
 
-def generate_input_recognizer(client: OpenAI, task_data: dict) -> dict:
-    """Generate valid_input/1 predicate from train inputs.
-
-    Returns dict with code and token usage.
-    """
+def generate_input_recognizer(client, task_data: dict) -> dict:
+    """Generate valid_input/1 predicate from train inputs."""
     prompt = format_input_recognizer_prompt(task_data)
     response = call_gemini(client, prompt)
 
@@ -244,8 +113,7 @@ def generate_input_recognizer(client: OpenAI, task_data: dict) -> dict:
 def test_input_recognizer(code: str, task_data: dict, test_inputs: list) -> dict:
     """Test input recognizer on train AND test inputs, plus specificity.
 
-    Returns results dict with pass/fail counts.
-    Thread-safe: uses global lock for pyswip operations.
+    Uses subprocess isolation - no locks needed.
     """
     train_inputs = [ex["input"] for ex in task_data["train"]]
 
@@ -258,45 +126,40 @@ def test_input_recognizer(code: str, task_data: dict, test_inputs: list) -> dict
         "errors": [],
     }
 
-    # Lock all Prolog operations - pyswip is not thread-safe
-    with _prolog_lock:
+    # Test train inputs
+    for i, grid in enumerate(train_inputs):
         try:
-            prolog = create_prolog_engine(code)
+            if test_valid_input(code, grid):
+                results["train_passed"] += 1
+            else:
+                results["errors"].append(f"Train {i}: valid_input failed")
+        except PrologTimeoutError:
+            results["errors"].append(f"Train {i}: timeout")
         except Exception as e:
-            results["errors"].append(f"Prolog syntax error: {str(e)[:100]}")
-            return results
+            results["errors"].append(f"Train {i}: {type(e).__name__}: {str(e)[:50]}")
 
-        # Test train inputs
-        for i, grid in enumerate(train_inputs):
-            try:
-                if test_valid_input(prolog, grid):
-                    results["train_passed"] += 1
-                else:
-                    results["errors"].append(f"Train {i}: valid_input failed")
-            except Exception as e:
-                results["errors"].append(f"Train {i}: {type(e).__name__}: {str(e)[:50]}")
+    # Test test inputs
+    for i, grid in enumerate(test_inputs):
+        try:
+            if test_valid_input(code, grid):
+                results["test_passed"] += 1
+            else:
+                results["errors"].append(f"Test {i}: valid_input failed")
+        except PrologTimeoutError:
+            results["errors"].append(f"Test {i}: timeout")
+        except Exception as e:
+            results["errors"].append(f"Test {i}: {type(e).__name__}: {str(e)[:50]}")
 
-        # Test test inputs (without leaking to LLM)
-        for i, grid in enumerate(test_inputs):
-            try:
-                if test_valid_input(prolog, grid):
-                    results["test_passed"] += 1
-                else:
-                    results["errors"].append(f"Test {i}: valid_input failed")
-            except Exception as e:
-                results["errors"].append(f"Test {i}: {type(e).__name__}: {str(e)[:50]}")
+    # Specificity test
+    specificity = test_specificity(code, train_inputs)
+    results["specificity_passed"] = specificity["success"]
+    results["specificity_rejections"] = specificity["rejections"]
+    if not specificity["success"]:
+        results["errors"].append(
+            f"Specificity failed: rejected {specificity['rejections']}/{specificity['total_tests']} "
+            f"(need >= {specificity['threshold']})"
+        )
 
-        # Specificity test - must reject random grids
-        specificity = test_specificity(prolog, train_inputs)
-        results["specificity_passed"] = specificity["success"]
-        results["specificity_rejections"] = specificity["rejections"]
-        if not specificity["success"]:
-            results["errors"].append(
-                f"Specificity failed: rejected {specificity['rejections']}/{specificity['total_tests']} "
-                f"(need >= {specificity['threshold']})"
-            )
-
-    # Success = all train + all test + specificity
     results["success"] = (
         results["train_passed"] == results["train_total"] and
         results["test_passed"] == results["test_total"] and
@@ -305,11 +168,8 @@ def test_input_recognizer(code: str, task_data: dict, test_inputs: list) -> dict
     return results
 
 
-def generate_transform(client: OpenAI, recognizer_code: str, task_data: dict) -> dict:
-    """Generate transform/2 predicate.
-
-    Returns dict with code and token usage.
-    """
+def generate_transform(client, recognizer_code: str, task_data: dict) -> dict:
+    """Generate transform/2 predicate."""
     prompt = format_transform_prompt(recognizer_code, task_data)
     response = call_gemini(client, prompt)
 
@@ -326,8 +186,7 @@ def generate_transform(client: OpenAI, recognizer_code: str, task_data: dict) ->
 def test_transform_full(recognizer_code: str, transform_code: str, task_data: dict, test_solutions: list) -> dict:
     """Test transform/2 on train AND test pairs.
 
-    Exact match required for success.
-    Thread-safe: uses global lock for pyswip operations.
+    Uses subprocess isolation - no locks needed.
     """
     results = {
         "train_passed": 0,
@@ -337,38 +196,33 @@ def test_transform_full(recognizer_code: str, transform_code: str, task_data: di
         "errors": [],
     }
 
-    # Combine recognizer + transform code
     full_code = recognizer_code + "\n\n" + transform_code
 
-    # Lock all Prolog operations - pyswip is not thread-safe
-    with _prolog_lock:
+    # Test train pairs
+    for i, ex in enumerate(task_data["train"]):
         try:
-            prolog = create_prolog_engine(full_code)
+            if test_transform(full_code, ex["input"], ex["output"]):
+                results["train_passed"] += 1
+            else:
+                results["errors"].append(f"Train {i}: transform mismatch")
+        except PrologTimeoutError:
+            results["errors"].append(f"Train {i}: timeout")
         except Exception as e:
-            results["errors"].append(f"Prolog syntax error: {str(e)[:100]}")
-            return results
+            results["errors"].append(f"Train {i}: {type(e).__name__}: {str(e)[:50]}")
 
-        # Test train pairs
-        for i, ex in enumerate(task_data["train"]):
-            try:
-                if test_transform(prolog, ex["input"], ex["output"]):
-                    results["train_passed"] += 1
-                else:
-                    results["errors"].append(f"Train {i}: transform mismatch")
-            except Exception as e:
-                results["errors"].append(f"Train {i}: {type(e).__name__}: {str(e)[:50]}")
-
-        # Test test pairs
-        for i, ex in enumerate(task_data.get("test", [])):
-            if i >= len(test_solutions):
-                continue
-            try:
-                if test_transform(prolog, ex["input"], test_solutions[i]):
-                    results["test_passed"] += 1
-                else:
-                    results["errors"].append(f"Test {i}: transform mismatch")
-            except Exception as e:
-                results["errors"].append(f"Test {i}: {type(e).__name__}: {str(e)[:50]}")
+    # Test test pairs
+    for i, ex in enumerate(task_data.get("test", [])):
+        if i >= len(test_solutions):
+            continue
+        try:
+            if test_transform(full_code, ex["input"], test_solutions[i]):
+                results["test_passed"] += 1
+            else:
+                results["errors"].append(f"Test {i}: transform mismatch")
+        except PrologTimeoutError:
+            results["errors"].append(f"Test {i}: timeout")
+        except Exception as e:
+            results["errors"].append(f"Test {i}: {type(e).__name__}: {str(e)[:50]}")
 
     results["success"] = (
         results["train_passed"] == results["train_total"] and
@@ -377,13 +231,7 @@ def test_transform_full(recognizer_code: str, transform_code: str, task_data: di
     return results
 
 
-def generate_and_test_transform(
-    client: OpenAI,
-    recognizer_code: str,
-    task_data: dict,
-    test_solutions: list,
-    attempt: int,
-) -> dict:
+def generate_and_test_transform(client, recognizer_code: str, task_data: dict, test_solutions: list, attempt: int) -> dict:
     """Generate and test a single transform attempt."""
     gen_result = generate_transform(client, recognizer_code, task_data)
 
@@ -419,25 +267,17 @@ def validate_prolog_task(
     transform_attempts: int = 4,
     concurrent_requests: int = 4,
 ) -> dict:
-    """Main validation loop for a single task using Prolog.
-
-    Two-phase approach:
-    1. Generate input recognizer (multiple attempts)
-    2. For each successful recognizer, generate transforms (multiple attempts)
-    """
-    # Load task
+    """Main validation loop for a single task using Prolog."""
     with open(TASKS_FILE) as f:
         all_tasks = json.load(f)
     if task_id not in all_tasks:
         return {"task_id": task_id, "success": False, "error": f"Task {task_id} not found"}
     task_data = all_tasks[task_id]
 
-    # Load solutions
     with open(SOLUTIONS_FILE) as f:
         all_solutions = json.load(f)
     test_solutions = all_solutions.get(task_id, [])
 
-    # Extract test inputs (for recognizer validation only, not shown to LLM)
     test_inputs = [ex["input"] for ex in task_data.get("test", [])]
 
     client = get_client()
@@ -446,7 +286,6 @@ def validate_prolog_task(
     for rec_attempt in range(1, recognizer_attempts + 1):
         print(f"\n=== Recognizer attempt {rec_attempt}/{recognizer_attempts} ===")
 
-        # Phase 1: Generate input recognizer
         rec_result = generate_input_recognizer(client, task_data)
         total_input += rec_result["input_tokens"]
         total_output += rec_result["output_tokens"]
@@ -458,7 +297,6 @@ def validate_prolog_task(
 
         print(f"Recognizer generated ({len(rec_result['code'])} chars)")
 
-        # Test recognizer
         rec_test = test_input_recognizer(rec_result["code"], task_data, test_inputs)
 
         train_status = f"{rec_test['train_passed']}/{rec_test['train_total']}"
@@ -473,7 +311,6 @@ def validate_prolog_task(
 
         print(f"Recognizer passed! Testing {transform_attempts} transforms...")
 
-        # Phase 2: Generate transforms (concurrent)
         with ThreadPoolExecutor(max_workers=concurrent_requests) as executor:
             futures = {
                 executor.submit(
@@ -499,7 +336,6 @@ def validate_prolog_task(
                 print(f"  Transform {result['attempt']}: {status}")
 
                 if result["success"]:
-                    # Cancel remaining and return success
                     for f in futures:
                         f.cancel()
 
@@ -523,7 +359,6 @@ def validate_prolog_task(
                         "total_cost_usd": round(cost, 4),
                     }
 
-    # All attempts failed
     cost = (total_input * INPUT_PRICE / 1_000_000) + (total_output * OUTPUT_PRICE / 1_000_000)
     return {
         "task_id": task_id,
@@ -561,7 +396,6 @@ def main():
 
     print("\n" + "=" * 60)
     print("RESULT:")
-    # Print without the code for brevity
     result_summary = {k: v for k, v in result.items() if not k.endswith("_code")}
     print(json.dumps(result_summary, indent=2))
 
@@ -571,7 +405,6 @@ def main():
         print("\n--- Transform Code ---")
         print(result["transform_code"][:500] + "..." if len(result.get("transform_code", "")) > 500 else result.get("transform_code", ""))
 
-    # Save result
     output_file = f"prolog_validation_result_{args.task}.json"
     with open(output_file, "w") as f:
         json.dump(result, f, indent=2)

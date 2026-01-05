@@ -23,14 +23,18 @@ from typing import Optional
 
 import aiohttp
 
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from llm_utils import MODEL
+
 # Configuration
 TRAINING_DIR = Path("external/ARC-AGI-2/data/training")
 RAW_OUTPUT_DIR = Path("traces/raw")
 PARSED_OUTPUT_DIR = Path("traces/parsed")
 PROGRESS_FILE = Path("traces/progress.json")
 
-# Gemini configuration
-MODEL_NAME = "gemini-2.0-flash"
+# Gemini configuration (use model from llm_utils for consistency)
+MODEL_NAME = MODEL
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 MAX_RETRIES = 3
 INITIAL_BACKOFF = 1.0  # seconds

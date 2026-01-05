@@ -5,7 +5,9 @@ Run: uv run validate_task.py --task 00576224
 """
 import argparse
 import json
+import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -27,6 +29,62 @@ sys.path.insert(0, str(Path(__file__).parent / "SDG" / "scripts"))
 from parser import parse_python_code
 from puzzle import validate_and_convert_grid
 from utils import recognize_summary, summary_to_text, convert_grid_to_string
+
+# Timeout for sandboxed code execution (seconds)
+CODE_EXECUTION_TIMEOUT = 10
+
+
+def run_code_sandboxed(code: str, input_grid: list, timeout: int = CODE_EXECUTION_TIMEOUT) -> dict:
+    """Run LLM-generated code in isolated subprocess for security.
+
+    Returns dict with keys:
+    - success: bool
+    - result: list (the output grid) or None
+    - error: error message if failed
+    """
+    # Convert numpy array to list if needed
+    if hasattr(input_grid, 'tolist'):
+        input_grid = input_grid.tolist()
+
+    script = f'''
+import json
+import numpy as np
+
+input_grid = np.array({json.dumps(input_grid)}, dtype=np.int8)
+
+{code}
+
+result = generate_puzzle_output(input_grid)
+# Convert to list for JSON serialization
+if hasattr(result, 'tolist'):
+    result = result.tolist()
+elif isinstance(result, np.ndarray):
+    result = result.tolist()
+print(json.dumps({{"success": True, "result": result}}))
+'''
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+        if result.returncode == 0:
+            try:
+                output = json.loads(result.stdout.strip())
+                return output
+            except json.JSONDecodeError:
+                return {"success": False, "result": None, "error": f"Invalid JSON: {result.stdout[:100]}"}
+        else:
+            error = result.stderr[:200] if result.stderr else "Unknown error"
+            return {"success": False, "result": None, "error": error}
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "result": None, "error": "Execution timeout"}
+    except Exception as e:
+        return {"success": False, "result": None, "error": str(e)[:200]}
 
 
 def format_task_for_prompt(task_data: dict) -> str:
@@ -74,7 +132,10 @@ def format_output_program_prompt(description: dict, task_data: dict) -> str:
 
 
 def test_program(code: str, task_data: dict, test_solutions: list = None) -> dict:
-    """Test generated code on train AND test examples. Returns results dict."""
+    """Test generated code on train AND test examples. Returns results dict.
+
+    Uses subprocess isolation to safely execute LLM-generated code.
+    """
     results = {
         "train_passed": 0, "train_total": len(task_data["train"]),
         "test_passed": 0, "test_total": len(task_data.get("test", [])),
@@ -83,60 +144,54 @@ def test_program(code: str, task_data: dict, test_solutions: list = None) -> dic
 
     # Test on train examples
     for i, ex in enumerate(task_data["train"]):
-        input_grid = np.array(ex["input"], dtype=np.int8)
+        input_grid = ex["input"]
         expected_output = np.array(ex["output"], dtype=np.int8)
 
-        try:
-            exec_globals = {"np": np, "numpy": np, "input_grid": input_grid}
-            full_code = code + "\n\nresult = generate_puzzle_output(input_grid)"
-            exec(full_code, exec_globals)
+        exec_result = run_code_sandboxed(code, input_grid)
 
-            if "result" not in exec_globals:
-                results["errors"].append(f"Train {i}: No result returned")
-                continue
+        if not exec_result["success"]:
+            results["errors"].append(f"Train {i}: {exec_result.get('error', 'Unknown error')[:50]}")
+            continue
 
-            actual_output = exec_globals["result"]
-            validated = validate_and_convert_grid(actual_output)
-            if validated is None:
-                results["errors"].append(f"Train {i}: Invalid grid format")
-                continue
+        actual_output = exec_result["result"]
+        validated = validate_and_convert_grid(actual_output)
+        if validated is None:
+            results["errors"].append(f"Train {i}: Invalid grid format")
+            continue
 
-            actual_array = np.array(validated, dtype=np.int8)
-            if np.array_equal(actual_array, expected_output):
-                results["train_passed"] += 1
-            else:
-                results["errors"].append(f"Train {i}: Output mismatch")
-        except Exception as e:
-            results["errors"].append(f"Train {i}: {type(e).__name__}: {str(e)[:50]}")
+        actual_array = np.array(validated, dtype=np.int8)
+        if np.array_equal(actual_array, expected_output):
+            results["train_passed"] += 1
+        else:
+            results["errors"].append(f"Train {i}: Output mismatch")
 
     # Test on test examples (if solutions available)
     if test_solutions:
         for i, ex in enumerate(task_data.get("test", [])):
-            input_grid = np.array(ex["input"], dtype=np.int8)
+            # Bounds check: skip if no solution available for this test
+            if i >= len(test_solutions):
+                continue
+
+            input_grid = ex["input"]
             expected_output = np.array(test_solutions[i], dtype=np.int8)
 
-            try:
-                exec_globals = {"np": np, "numpy": np, "input_grid": input_grid}
-                full_code = code + "\n\nresult = generate_puzzle_output(input_grid)"
-                exec(full_code, exec_globals)
+            exec_result = run_code_sandboxed(code, input_grid)
 
-                if "result" not in exec_globals:
-                    results["errors"].append(f"Test {i}: No result returned")
-                    continue
+            if not exec_result["success"]:
+                results["errors"].append(f"Test {i}: {exec_result.get('error', 'Unknown error')[:50]}")
+                continue
 
-                actual_output = exec_globals["result"]
-                validated = validate_and_convert_grid(actual_output)
-                if validated is None:
-                    results["errors"].append(f"Test {i}: Invalid grid format")
-                    continue
+            actual_output = exec_result["result"]
+            validated = validate_and_convert_grid(actual_output)
+            if validated is None:
+                results["errors"].append(f"Test {i}: Invalid grid format")
+                continue
 
-                actual_array = np.array(validated, dtype=np.int8)
-                if np.array_equal(actual_array, expected_output):
-                    results["test_passed"] += 1
-                else:
-                    results["errors"].append(f"Test {i}: Output mismatch")
-            except Exception as e:
-                results["errors"].append(f"Test {i}: {type(e).__name__}: {str(e)[:50]}")
+            actual_array = np.array(validated, dtype=np.int8)
+            if np.array_equal(actual_array, expected_output):
+                results["test_passed"] += 1
+            else:
+                results["errors"].append(f"Test {i}: Output mismatch")
 
     # Success = all train AND all test pass
     results["success"] = (results["train_passed"] == results["train_total"] and
