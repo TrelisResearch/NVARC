@@ -18,11 +18,10 @@ from validate_task import (
     generate_description,
     generate_and_test_program,
     get_client,
-    TASKS_FILE,
-    SOLUTIONS_FILE,
     INPUT_PRICE,
     OUTPUT_PRICE,
 )
+from llm_utils import TASKS_FILE, SOLUTIONS_FILE, EVAL_TASKS_FILE, EVAL_SOLUTIONS_FILE
 
 RESULTS_FILE = Path(__file__).parent / "validation_results.jsonl"
 SUMMARY_FILE = Path(__file__).parent / "validation_summary.json"
@@ -280,16 +279,20 @@ def main():
     parser.add_argument("--max-description-rounds", type=int, default=2, help="Max description attempts per task")
     parser.add_argument("--max-program-attempts", type=int, default=4, help="Max program attempts per description")
     parser.add_argument("--clear", action="store_true", help="Clear previous results and start fresh")
+    parser.add_argument("--eval", action="store_true", help="Use evaluation dataset instead of training")
     args = parser.parse_args()
 
-    # Load all tasks and solutions
-    with open(TASKS_FILE) as f:
+    # Load all tasks and solutions (use evaluation set if --eval flag)
+    tasks_file = EVAL_TASKS_FILE if args.eval else TASKS_FILE
+    solutions_file = EVAL_SOLUTIONS_FILE if args.eval else SOLUTIONS_FILE
+    with open(tasks_file) as f:
         all_tasks = json.load(f)
-    with open(SOLUTIONS_FILE) as f:
+    with open(solutions_file) as f:
         all_solutions = json.load(f)
 
     task_ids = sorted(all_tasks.keys())
-    print(f"Loaded {len(task_ids)} tasks")
+    dataset_name = "evaluation" if args.eval else "training"
+    print(f"Loaded {len(task_ids)} {dataset_name} tasks")
 
     if args.clear:
         if RESULTS_FILE.exists():

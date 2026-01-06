@@ -48,6 +48,7 @@ ROUND 2 (failures only):
 ### Python Validator
 ```
 uv run validate_all_tasks.py --sample 10 --max-concurrent 64
+uv run validate_all_tasks.py --eval --sample 8   # Use evaluation dataset
 ```
 
 ### Prolog Validator
